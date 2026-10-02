@@ -48,6 +48,20 @@ public class SubscriptionController {
         return changeView(pc);
     }
 
+    @PostMapping("/{id}/pause")
+    public Map<String, Object> pause(@PathVariable String id, @RequestBody Map<String, Object> req) {
+        PlanChange pc = subscriptionService.pause(id, str(req, "idempotencyKey"),
+                instant(req, "effectiveAt", clock.now()));
+        return changeView(pc);
+    }
+
+    @PostMapping("/{id}/resume")
+    public Map<String, Object> resume(@PathVariable String id, @RequestBody Map<String, Object> req) {
+        PlanChange pc = subscriptionService.resume(id, str(req, "idempotencyKey"),
+                instant(req, "effectiveAt", clock.now()));
+        return changeView(pc);
+    }
+
     @GetMapping("/{id}")
     public Map<String, Object> get(@PathVariable String id) {
         return toView(subscriptionService.getSubscription(id));

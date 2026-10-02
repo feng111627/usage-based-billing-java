@@ -177,6 +177,26 @@ public class PaymentServiceImpl implements PaymentService {
             throw new BillingException(ErrorCode.INVALID_AMOUNT, "退款金额必须为正: " + rawAmount);
         }
 
+        // 超额退款拦截：同一订阅累计成功退款 + 本次退款不得超过累计成功收款，
+        // 杜绝重复退款/超额退款击穿三方守恒（对账另有同口径检查兜底）
+        BigDecimal charged = BigDecimal.ZERO;
+        BigDecimal refunded = BigDecimal.ZERO;
+        for (PaymentAttempt a : paymentRepository.findAll()) {
+            if (!a.getSubscriptionId().equals(invoice.getSubscriptionId()) || !a.isSuccess()) {
+                continue;
+            }
+            if (a.isRefund()) {
+                refunded = refunded.add(a.getAmount());
+            } else {
+                charged = charged.add(a.getAmount());
+            }
+        }
+        if (refunded.add(amount).compareTo(charged) > 0) {
+            throw new BillingException(ErrorCode.CONFLICT,
+                    "超额退款被拦截: 订阅 " + invoice.getSubscriptionId() + " 累计收款=" + charged
+                            + " 累计退款=" + refunded + " 本次拟退=" + amount);
+        }
+
         PaymentAttempt attempt = newAttempt(invoice, 0, amount, key, true);
         LocalPaymentGateway.GatewayResult result = gateway.refund(invoice.getInvoiceId(), amount);
         attempt.setSuccess(result.success());
@@ -225,9 +245,12 @@ public class PaymentServiceImpl implements PaymentService {
         if (invoice.getPeriodStart() != null && invoice.getPeriodStart().equals(sub.getCurrentPeriodStart())) {
             sub.setCurrentPeriodStart(invoice.getPeriodEnd());
             sub.setCurrentPeriodEnd(calendar.nextPeriodStart(invoice.getPeriodEnd(), sub.getAnchorDay()));
-            sub.setStatus(SubscriptionStatus.ACTIVE);
-            log.info("[post-pay] sub={} 周期账单收讫 -> 恢复 ACTIVE 并滚动周期至 {} ~ {}",
-                    sub.getSubscriptionId(), sub.getCurrentPeriodStart(), sub.getCurrentPeriodEnd());
+            // 客户主动暂停跨周期：滚动周期但保持 PAUSED（与收款失败的 SUSPENDED 恢复 ACTIVE 相区分）
+            if (sub.getStatus() != SubscriptionStatus.PAUSED) {
+                sub.setStatus(SubscriptionStatus.ACTIVE);
+            }
+            log.info("[post-pay] sub={} 周期账单收讫 -> 滚动周期至 {} ~ {}，订阅状态={}",
+                    sub.getSubscriptionId(), sub.getCurrentPeriodStart(), sub.getCurrentPeriodEnd(), sub.getStatus());
         }
         subscriptionRepository.save(sub);
     }

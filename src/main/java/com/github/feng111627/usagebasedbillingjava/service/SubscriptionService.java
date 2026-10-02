@@ -19,5 +19,17 @@ public interface SubscriptionService {
     /** 退订：按剩余周期比例退回当前周期未消耗基础费。 */
     PlanChange cancel(String subscriptionId, String idempotencyKey, Instant effectiveAt);
 
+    /**
+     * 客户主动暂停：自 effectiveAt 起不再产生基础费，按剩余周期比例退回本周期未消耗基础费。
+     * 与收款失败的 SUSPENDED 是不同状态（PAUSED）。幂等键重复提交返回首次结果。
+     */
+    PlanChange pause(String subscriptionId, String idempotencyKey, Instant effectiveAt);
+
+    /**
+     * 从暂停恢复：自 effectiveAt 起按剩余周期比例补收本周期基础费，
+     * 本周期配额按活跃时长等比例折算。幂等键重复提交返回首次结果。
+     */
+    PlanChange resume(String subscriptionId, String idempotencyKey, Instant effectiveAt);
+
     Subscription getSubscription(String subscriptionId);
 }

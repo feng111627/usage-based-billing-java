@@ -10,6 +10,7 @@ import com.github.feng111627.usagebasedbillingjava.model.UsageEvent;
 import com.github.feng111627.usagebasedbillingjava.repository.Repositories;
 import com.github.feng111627.usagebasedbillingjava.service.BillingCalendar;
 import com.github.feng111627.usagebasedbillingjava.service.ClockService;
+import com.github.feng111627.usagebasedbillingjava.service.PauseWindows;
 import com.github.feng111627.usagebasedbillingjava.service.SubscriptionLocks;
 import com.github.feng111627.usagebasedbillingjava.service.UsageService;
 import org.slf4j.Logger;
@@ -42,6 +43,7 @@ public class UsageServiceImpl implements UsageService {
     private final Repositories.UsageAccumulationRepository accumulationRepository;
     private final Repositories.SubscriptionRepository subscriptionRepository;
     private final Repositories.InvoiceRepository invoiceRepository;
+    private final Repositories.ChangeRepository changeRepository;
     private final BillingCalendar calendar;
     private final ClockService clock;
     private final SubscriptionLocks locks;
@@ -50,11 +52,13 @@ public class UsageServiceImpl implements UsageService {
                             Repositories.UsageAccumulationRepository accumulationRepository,
                             Repositories.SubscriptionRepository subscriptionRepository,
                             Repositories.InvoiceRepository invoiceRepository,
+                            Repositories.ChangeRepository changeRepository,
                             BillingCalendar calendar, ClockService clock, SubscriptionLocks locks) {
         this.eventRepository = eventRepository;
         this.accumulationRepository = accumulationRepository;
         this.subscriptionRepository = subscriptionRepository;
         this.invoiceRepository = invoiceRepository;
+        this.changeRepository = changeRepository;
         this.calendar = calendar;
         this.clock = clock;
         this.locks = locks;
@@ -80,6 +84,14 @@ public class UsageServiceImpl implements UsageService {
                     "订阅已退订，不接受用量上报: " + subscriptionId);
         }
         Instant at = usageAt != null ? usageAt : clock.now();
+        // 客户主动暂停窗口内发生的用量明确拒绝（与收款失败停用相区分）：
+        // 不按零处理、不记到别的周期；暂停之前真实发生的用量（usageAt 早于暂停生效点）
+        // 即使在暂停期间补报也正常放行，由后续账段口径计费。
+        if (PauseWindows.isPausedAt(at, changeRepository.findBySubscription(subscriptionId))) {
+            throw new BillingException(ErrorCode.SUBSCRIPTION_PAUSED,
+                    "用量发生时刻 " + at + " 处于客户主动暂停窗口内，订阅 " + subscriptionId
+                            + " 不接受该时段的用量上报（暂停期间不计量，恢复后按活跃账段继续累计）");
+        }
         String periodKey = calendar.periodKey(at, sub.getAnchorDay());
 
         // 第一步：全局 eventId 幂等判定（跨订阅也不允许复用 eventId 携带不同内容）

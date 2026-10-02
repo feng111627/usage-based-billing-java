@@ -181,22 +181,7 @@ public class SubscriptionServiceImpl implements SubscriptionService {
     }
 
     private PlanChange applyChange(Subscription s, Plan from, Plan to, String key, Instant requestedAt) {
-        Instant eff = requestedAt != null ? requestedAt : clock.now();
-        if (s.getLastChangeSeq() > 0) {
-            PlanChange last = changeRepository.findBySubscription(s.getSubscriptionId())
-                    .stream().reduce((a, b) -> b).orElseThrow();
-            if (eff.isBefore(last.getEffectiveAt())) {
-                throw new BillingException(ErrorCode.CHANGE_OUT_OF_ORDER,
-                        "变更生效时间 " + eff + " 早于上一次变更 " + last.getEffectiveAt()
-                                + "（seq=" + last.getSeq() + "），乱序请求被拒绝");
-            }
-        }
-        if (eff.isBefore(s.getCurrentPeriodStart()) || !eff.isBefore(s.getCurrentPeriodEnd())) {
-            throw new BillingException(ErrorCode.VALIDATION,
-                    "生效时间 " + eff + " 不在当前周期 [" + s.getCurrentPeriodStart() + ","
-                            + s.getCurrentPeriodEnd() + ") 内");
-        }
-
+        Instant eff = validateEffectiveAt(s, requestedAt);
         BigDecimal ratio = calendar.remainingRatio(eff, s.getCurrentPeriodStart(), s.getCurrentPeriodEnd());
         ChangeType type;
         BigDecimal delta;
@@ -254,6 +239,147 @@ public class SubscriptionServiceImpl implements SubscriptionService {
     }
 
     @Override
+    public PlanChange pause(String subscriptionId, String idempotencyKey, Instant effectiveAt) {
+        return locks.withLock(subscriptionId, () -> doPause(subscriptionId, idempotencyKey, effectiveAt));
+    }
+
+    @Override
+    public PlanChange resume(String subscriptionId, String idempotencyKey, Instant effectiveAt) {
+        return locks.withLock(subscriptionId, () -> doResume(subscriptionId, idempotencyKey, effectiveAt));
+    }
+
+    private PlanChange doPause(String subscriptionId, String key, Instant requestedAt) {
+        Subscription s = requireSubscription(subscriptionId);
+        if (key == null || key.isBlank()) {
+            throw new BillingException(ErrorCode.VALIDATION, "暂停必须携带 idempotencyKey");
+        }
+        // 幂等重放优先于一切业务校验：重复提交返回首次结果，不重复退款
+        var replay = changeRepository.findByIdempotencyKey(key);
+        if (replay.isPresent()) {
+            PlanChange pc = replay.get();
+            if (!pc.getSubscriptionId().equals(subscriptionId)) {
+                throw new BillingException(ErrorCode.DUPLICATE_REQUEST,
+                        "幂等键 " + key + " 已用于其他订阅 " + pc.getSubscriptionId());
+            }
+            log.info("[pause] 幂等重放 key={} seq={} -> 返回原暂停结果，不重复退款", key, pc.getSeq());
+            return pc;
+        }
+        switch (s.getStatus()) {
+            case ACTIVE -> { }
+            case PAUSED -> throw new BillingException(ErrorCode.SUBSCRIPTION_PAUSED,
+                    "订阅已处于客户主动暂停中，无需重复暂停: " + subscriptionId);
+            case PAST_DUE -> throw new BillingException(ErrorCode.CONFLICT,
+                    "订阅处于宽限期（存在未收账单），结清后才能暂停: " + subscriptionId);
+            case SUSPENDED -> throw new BillingException(ErrorCode.SUBSCRIPTION_SUSPENDED,
+                    "订阅因收款失败被停用（非客户主动暂停），需补缴恢复: " + subscriptionId);
+            case CANCELLED -> throw new BillingException(ErrorCode.SUBSCRIPTION_INACTIVE,
+                    "订阅已退订: " + subscriptionId);
+        }
+        Plan plan = planService.getPlan(s.getCurrentPlanId());
+        Instant eff = validateEffectiveAt(s, requestedAt);
+        BigDecimal ratio = calendar.remainingRatio(eff, s.getCurrentPeriodStart(), s.getCurrentPeriodEnd());
+        // 暂停：按暂停时刻到周期末的剩余比例退回本周期已预付但未消耗的基础费
+        BigDecimal delta = Money.prorate(plan.getBasePrice().negate(), ratio);
+        String basis = "暂停退回未消耗基础费 basePrice=" + plan.getBasePrice()
+                + " 剩余比例=" + ratio + " 生效=" + eff;
+        return settlePauseResume(s, plan, ChangeType.PAUSE, eff, delta, key,
+                "客户主动暂停 " + plan.getName() + " 剩余周期基础费退回", basis);
+    }
+
+    private PlanChange doResume(String subscriptionId, String key, Instant requestedAt) {
+        Subscription s = requireSubscription(subscriptionId);
+        if (key == null || key.isBlank()) {
+            throw new BillingException(ErrorCode.VALIDATION, "恢复必须携带 idempotencyKey");
+        }
+        var replay = changeRepository.findByIdempotencyKey(key);
+        if (replay.isPresent()) {
+            PlanChange pc = replay.get();
+            if (!pc.getSubscriptionId().equals(subscriptionId)) {
+                throw new BillingException(ErrorCode.DUPLICATE_REQUEST,
+                        "幂等键 " + key + " 已用于其他订阅 " + pc.getSubscriptionId());
+            }
+            log.info("[resume] 幂等重放 key={} seq={} -> 返回原恢复结果，不重复扣款", key, pc.getSeq());
+            return pc;
+        }
+        switch (s.getStatus()) {
+            case PAUSED -> { }
+            case ACTIVE -> throw new BillingException(ErrorCode.CONFLICT,
+                    "订阅处于活跃状态，无需恢复: " + subscriptionId);
+            case PAST_DUE -> throw new BillingException(ErrorCode.CONFLICT,
+                    "订阅处于宽限期（存在未收账单），非客户暂停状态，请结清账单: " + subscriptionId);
+            case SUSPENDED -> throw new BillingException(ErrorCode.SUBSCRIPTION_SUSPENDED,
+                    "订阅因收款失败被停用（非客户主动暂停），请走补缴恢复: " + subscriptionId);
+            case CANCELLED -> throw new BillingException(ErrorCode.SUBSCRIPTION_INACTIVE,
+                    "订阅已退订: " + subscriptionId);
+        }
+        Plan plan = planService.getPlan(s.getCurrentPlanId());
+        Instant eff = validateEffectiveAt(s, requestedAt);
+        BigDecimal ratio = calendar.remainingRatio(eff, s.getCurrentPeriodStart(), s.getCurrentPeriodEnd());
+        // 恢复：按恢复时刻到周期末的剩余比例重新收取本周期基础费
+        BigDecimal delta = Money.prorate(plan.getBasePrice(), ratio);
+        String basis = "恢复补收本周期基础费 basePrice=" + plan.getBasePrice()
+                + " 剩余比例=" + ratio + " 生效=" + eff;
+        return settlePauseResume(s, plan, ChangeType.RESUME, eff, delta, key,
+                "暂停恢复 " + plan.getName() + " 剩余周期基础费补收", basis);
+    }
+
+    /** 暂停/恢复共用：出差价账单 -> 通道结清（失败则状态不推进）-> 落变更 -> 推进状态。 */
+    private PlanChange settlePauseResume(Subscription s, Plan plan, ChangeType type, Instant eff,
+                                         BigDecimal delta, String key, String desc, String basis) {
+        long seq = s.getLastChangeSeq() + 1;
+        Invoice invoice = buildProrationInvoice(s, seq, delta, desc, basis);
+        invoiceRepository.save(invoice);
+
+        // 通道结算失败则直接抛出：除发票草稿外未做任何状态推进，同幂等键重试安全
+        if (delta.signum() > 0) {
+            paymentService.charge(invoice, "resume:" + key);
+        } else if (delta.signum() < 0) {
+            paymentService.refund(invoice.getInvoiceId(), delta.negate(), "rfnd:" + key);
+        }
+
+        PlanChange pc = new PlanChange();
+        pc.setSeq(seq);
+        pc.setSubscriptionId(s.getSubscriptionId());
+        pc.setType(type);
+        pc.setFromPlanId(plan.getPlanId());
+        pc.setToPlanId(plan.getPlanId());
+        pc.setEffectiveAt(eff);
+        pc.setProration(delta);
+        pc.setInvoiceId(invoice.getInvoiceId());
+        pc.setIdempotencyKey(key);
+        changeRepository.save(pc);
+
+        s.setLastChangeSeq(seq);
+        s.setStatus(type == ChangeType.PAUSE ? SubscriptionStatus.PAUSED : SubscriptionStatus.ACTIVE);
+        subscriptionRepository.save(s);
+
+        log.info("[{}] 输入 sub={} key={} eff={}；判定依据：{}；差价={} 发票={} seq={} -> 状态={}",
+                type == ChangeType.PAUSE ? "pause" : "resume",
+                s.getSubscriptionId(), key, eff, basis, delta, invoice.getInvoiceId(), seq, s.getStatus());
+        return pc;
+    }
+
+    /** 生效时间校验：不得早于上一次变更（乱序拒绝），且必须落在当前周期内。 */
+    private Instant validateEffectiveAt(Subscription s, Instant requestedAt) {
+        Instant eff = requestedAt != null ? requestedAt : clock.now();
+        if (s.getLastChangeSeq() > 0) {
+            PlanChange last = changeRepository.findBySubscription(s.getSubscriptionId())
+                    .stream().reduce((a, b) -> b).orElseThrow();
+            if (eff.isBefore(last.getEffectiveAt())) {
+                throw new BillingException(ErrorCode.CHANGE_OUT_OF_ORDER,
+                        "变更生效时间 " + eff + " 早于上一次变更 " + last.getEffectiveAt()
+                                + "（seq=" + last.getSeq() + "），乱序请求被拒绝");
+            }
+        }
+        if (eff.isBefore(s.getCurrentPeriodStart()) || !eff.isBefore(s.getCurrentPeriodEnd())) {
+            throw new BillingException(ErrorCode.VALIDATION,
+                    "生效时间 " + eff + " 不在当前周期 [" + s.getCurrentPeriodStart() + ","
+                            + s.getCurrentPeriodEnd() + ") 内");
+        }
+        return eff;
+    }
+
+    @Override
     public Subscription getSubscription(String subscriptionId) {
         return requireSubscription(subscriptionId);
     }
@@ -286,7 +412,9 @@ public class SubscriptionServiceImpl implements SubscriptionService {
             case PAST_DUE -> throw new BillingException(ErrorCode.CONFLICT,
                     "订阅处于宽限期（存在未收账单），结清后才能变更: " + s.getSubscriptionId());
             case SUSPENDED -> throw new BillingException(ErrorCode.SUBSCRIPTION_SUSPENDED,
-                    "订阅已暂停，补缴恢复后才能变更: " + s.getSubscriptionId());
+                    "订阅因收款失败被停用，补缴恢复后才能变更: " + s.getSubscriptionId());
+            case PAUSED -> throw new BillingException(ErrorCode.SUBSCRIPTION_PAUSED,
+                    "订阅处于客户主动暂停中，恢复（resume）后才能变更/退订: " + s.getSubscriptionId());
             case CANCELLED -> throw new BillingException(ErrorCode.SUBSCRIPTION_INACTIVE,
                     "订阅已退订: " + s.getSubscriptionId());
         }
