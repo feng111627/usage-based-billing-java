@@ -176,6 +176,7 @@ public class PaymentServiceImpl implements PaymentService {
         if (amount.signum() <= 0) {
             throw new BillingException(ErrorCode.INVALID_AMOUNT, "退款金额必须为正: " + rawAmount);
         }
+        assertRefundNotExceedingPaid(invoice, amount);
 
         PaymentAttempt attempt = newAttempt(invoice, 0, amount, key, true);
         LocalPaymentGateway.GatewayResult result = gateway.refund(invoice.getInvoiceId(), amount);
@@ -225,11 +226,43 @@ public class PaymentServiceImpl implements PaymentService {
         if (invoice.getPeriodStart() != null && invoice.getPeriodStart().equals(sub.getCurrentPeriodStart())) {
             sub.setCurrentPeriodStart(invoice.getPeriodEnd());
             sub.setCurrentPeriodEnd(calendar.nextPeriodStart(invoice.getPeriodEnd(), sub.getAnchorDay()));
-            sub.setStatus(SubscriptionStatus.ACTIVE);
-            log.info("[post-pay] sub={} 周期账单收讫 -> 恢复 ACTIVE 并滚动周期至 {} ~ {}",
-                    sub.getSubscriptionId(), sub.getCurrentPeriodStart(), sub.getCurrentPeriodEnd());
+            // 客户主动暂停(PAUSED)不能因任何一笔收款被滚成 ACTIVE；只有补缴恢复 PAST_DUE/SUSPENDED 才转 ACTIVE
+            if (sub.getStatus() != SubscriptionStatus.PAUSED) {
+                sub.setStatus(SubscriptionStatus.ACTIVE);
+            }
+            log.info("[post-pay] sub={} 周期账单收讫 -> 滚动周期至 {} ~ {}，订阅状态={}",
+                    sub.getSubscriptionId(), sub.getCurrentPeriodStart(), sub.getCurrentPeriodEnd(), sub.getStatus());
         }
         subscriptionRepository.save(sub);
+    }
+
+    /**
+     * 退款守恒护栏：该订阅“已经成功收到的钱 − 已经成功退回的钱 − 本次拟退”必须 ≥ 0。
+     * 跨所有账单统计，防止重复退款/超额退款（暂停退基础费与升降配/退订退款共用同一上限）。
+     * 失败的尝试不计入（钱从未真正流动）。
+     */
+    private void assertRefundNotExceedingPaid(Invoice invoice, BigDecimal refundAmount) {
+        BigDecimal paidTotal = BigDecimal.ZERO;
+        BigDecimal refundedTotal = BigDecimal.ZERO;
+        for (Invoice x : invoiceRepository.findBySubscription(invoice.getSubscriptionId())) {
+            for (PaymentAttempt a : paymentRepository.findByInvoice(x.getInvoiceId())) {
+                if (!a.isSuccess()) {
+                    continue;
+                }
+                if (a.isRefund()) {
+                    refundedTotal = refundedTotal.add(a.getAmount());
+                } else {
+                    paidTotal = paidTotal.add(a.getAmount());
+                }
+            }
+        }
+        BigDecimal net = paidTotal.subtract(refundedTotal).subtract(refundAmount);
+        if (net.signum() < 0) {
+            throw new BillingException(ErrorCode.REFUND_LIMIT_EXCEEDED,
+                    "退款将超过该订阅已收到的钱：累计收款=" + Money.of(paidTotal)
+                            + " 已退=" + Money.of(refundedTotal) + " 本次申请退=" + refundAmount
+                            + "（退款后净额=" + Money.of(net) + "），守恒护栏拦截，拒绝落账");
+        }
     }
 
     private PaymentAttempt newAttempt(Invoice invoice, int attemptNo, BigDecimal amount, String key, boolean refund) {

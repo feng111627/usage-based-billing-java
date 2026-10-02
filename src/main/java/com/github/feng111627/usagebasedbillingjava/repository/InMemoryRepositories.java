@@ -3,6 +3,7 @@ package com.github.feng111627.usagebasedbillingjava.repository;
 import com.github.feng111627.usagebasedbillingjava.model.Invoice;
 import com.github.feng111627.usagebasedbillingjava.model.LedgerTransaction;
 import com.github.feng111627.usagebasedbillingjava.model.PaymentAttempt;
+import com.github.feng111627.usagebasedbillingjava.model.PauseRecord;
 import com.github.feng111627.usagebasedbillingjava.model.Plan;
 import com.github.feng111627.usagebasedbillingjava.model.PlanChange;
 import com.github.feng111627.usagebasedbillingjava.model.Subscription;
@@ -261,6 +262,45 @@ public class InMemoryRepositories {
             @Override
             public List<LedgerTransaction> findAll() {
                 return new ArrayList<>(store.values());
+            }
+        };
+    }
+
+    @Bean
+    public Repositories.PauseRepository pauseRepository() {
+        return new Repositories.PauseRepository() {
+            private final Map<String, PauseRecord> byId = new ConcurrentHashMap<>();
+            private final Map<String, String> idempotencyIndex = new ConcurrentHashMap<>();
+
+            @Override
+            public synchronized PauseRecord save(PauseRecord record) {
+                byId.put(record.getSubscriptionId() + "#" + record.getSeq(), record);
+                if (record.getIdempotencyKey() != null) {
+                    idempotencyIndex.put(record.getIdempotencyKey(),
+                            record.getSubscriptionId() + "#" + record.getSeq());
+                }
+                return record;
+            }
+
+            @Override
+            public synchronized List<PauseRecord> findBySubscription(String subscriptionId) {
+                return byId.entrySet().stream()
+                        .filter(e -> e.getKey().startsWith(subscriptionId + "#"))
+                        .map(Map.Entry::getValue)
+                        .sorted((a, b) -> Long.compare(a.getSeq(), b.getSeq()))
+                        .toList();
+            }
+
+            @Override
+            public synchronized Optional<PauseRecord> findByIdempotencyKey(String key) {
+                return Optional.ofNullable(idempotencyIndex.get(key)).map(byId::get);
+            }
+
+            @Override
+            public synchronized List<PauseRecord> findAll() {
+                return byId.values().stream()
+                        .sorted((a, b) -> Long.compare(a.getSeq(), b.getSeq()))
+                        .toList();
             }
         };
     }

@@ -19,5 +19,11 @@ public enum ErrorCode {
     INVOICE_ALREADY_PAID,
     NOTHING_TO_CLOSE,
     GATEWAY_REJECTED,
+    /** 客户主动暂停（PAUSED）引发的操作被拒，与收款失败 SUSPENDED 明确区分。 */
+    SUBSCRIPTION_PAUSED_BY_CUSTOMER,
+    /** 用量发生时间落在暂停账段内，明确拒绝，既不当零也不记到别的周期。 */
+    USAGE_DURING_PAUSE,
+    /** 退款累计将超过该订阅已经收到的钱，被守恒规则拦住。 */
+    REFUND_LIMIT_EXCEEDED,
     CONFLICT
 }

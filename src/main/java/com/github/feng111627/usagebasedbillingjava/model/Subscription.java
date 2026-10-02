@@ -18,6 +18,8 @@ public class Subscription {
     /** 单调递增的变更序号，用于拒绝乱序变更（同一时刻多次变更按接收顺序排队）。 */
     private long lastChangeSeq;
     private String pendingPaymentIdempotencyKey;
+    /** 当前客户主动暂停的生效时刻；非暂停态为 null。收款失败 SUSPENDED 不写此字段，两类停用可区分。 */
+    private Instant pausedSince;
 
     public String getSubscriptionId() { return subscriptionId; }
     public void setSubscriptionId(String subscriptionId) { this.subscriptionId = subscriptionId; }
@@ -39,4 +41,6 @@ public class Subscription {
     public void setLastChangeSeq(long lastChangeSeq) { this.lastChangeSeq = lastChangeSeq; }
     public String getPendingPaymentIdempotencyKey() { return pendingPaymentIdempotencyKey; }
     public void setPendingPaymentIdempotencyKey(String k) { this.pendingPaymentIdempotencyKey = k; }
+    public Instant getPausedSince() { return pausedSince; }
+    public void setPausedSince(Instant pausedSince) { this.pausedSince = pausedSince; }
 }

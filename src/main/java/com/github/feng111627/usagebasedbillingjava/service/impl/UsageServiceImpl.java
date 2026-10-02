@@ -4,12 +4,14 @@ import com.github.feng111627.usagebasedbillingjava.error.BillingException;
 import com.github.feng111627.usagebasedbillingjava.error.ErrorCode;
 import com.github.feng111627.usagebasedbillingjava.model.Subscription;
 import com.github.feng111627.usagebasedbillingjava.model.Invoice;
+import com.github.feng111627.usagebasedbillingjava.model.PauseRecord;
 import com.github.feng111627.usagebasedbillingjava.model.SubscriptionStatus;
 import com.github.feng111627.usagebasedbillingjava.model.UsageAccumulation;
 import com.github.feng111627.usagebasedbillingjava.model.UsageEvent;
 import com.github.feng111627.usagebasedbillingjava.repository.Repositories;
 import com.github.feng111627.usagebasedbillingjava.service.BillingCalendar;
 import com.github.feng111627.usagebasedbillingjava.service.ClockService;
+import com.github.feng111627.usagebasedbillingjava.service.PauseTimeline;
 import com.github.feng111627.usagebasedbillingjava.service.SubscriptionLocks;
 import com.github.feng111627.usagebasedbillingjava.service.UsageService;
 import org.slf4j.Logger;
@@ -42,6 +44,7 @@ public class UsageServiceImpl implements UsageService {
     private final Repositories.UsageAccumulationRepository accumulationRepository;
     private final Repositories.SubscriptionRepository subscriptionRepository;
     private final Repositories.InvoiceRepository invoiceRepository;
+    private final Repositories.PauseRepository pauseRepository;
     private final BillingCalendar calendar;
     private final ClockService clock;
     private final SubscriptionLocks locks;
@@ -50,11 +53,13 @@ public class UsageServiceImpl implements UsageService {
                             Repositories.UsageAccumulationRepository accumulationRepository,
                             Repositories.SubscriptionRepository subscriptionRepository,
                             Repositories.InvoiceRepository invoiceRepository,
+                            Repositories.PauseRepository pauseRepository,
                             BillingCalendar calendar, ClockService clock, SubscriptionLocks locks) {
         this.eventRepository = eventRepository;
         this.accumulationRepository = accumulationRepository;
         this.subscriptionRepository = subscriptionRepository;
         this.invoiceRepository = invoiceRepository;
+        this.pauseRepository = pauseRepository;
         this.calendar = calendar;
         this.clock = clock;
         this.locks = locks;
@@ -80,6 +85,22 @@ public class UsageServiceImpl implements UsageService {
                     "订阅已退订，不接受用量上报: " + subscriptionId);
         }
         Instant at = usageAt != null ? usageAt : clock.now();
+
+        // 客户主动暂停账段内的用量：按可区分原因明确拒绝，绝不悄悄当零，也不记到别的周期；
+        // 暂停前真实发生、暂停期间才补报的用量（at 早于暂停起点）不受影响，正常按活跃账段累计。
+        List<PauseRecord> pauseRecords = pauseRepository.findBySubscription(subscriptionId);
+        if (!pauseRecords.isEmpty()) {
+            List<PauseTimeline.Segment> segments =
+                    PauseTimeline.segments(pauseRecords, sub.getCurrentPeriodEnd());
+            PauseTimeline.Segment hit = segments.stream()
+                    .filter(g -> g.contains(at)).findFirst().orElse(null);
+            if (hit != null) {
+                throw new BillingException(ErrorCode.USAGE_DURING_PAUSE,
+                        "用量发生时间 " + at + " 落在客户主动暂停账段 [" + hit.start() + ","
+                                + hit.end() + ") 内，暂停期间不接受新用量上报（区别于收款失败停用）；"
+                                + "请在恢复后上报恢复时刻之后的用量");
+            }
+        }
         String periodKey = calendar.periodKey(at, sub.getAnchorDay());
 
         // 第一步：全局 eventId 幂等判定（跨订阅也不允许复用 eventId 携带不同内容）

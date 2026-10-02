@@ -5,6 +5,7 @@ import com.github.feng111627.usagebasedbillingjava.error.ErrorCode;
 import com.github.feng111627.usagebasedbillingjava.model.PlanChange;
 import com.github.feng111627.usagebasedbillingjava.model.Subscription;
 import com.github.feng111627.usagebasedbillingjava.service.ClockService;
+import com.github.feng111627.usagebasedbillingjava.service.PauseService;
 import com.github.feng111627.usagebasedbillingjava.service.SubscriptionService;
 import org.springframework.web.bind.annotation.*;
 
@@ -17,10 +18,13 @@ import java.util.Map;
 public class SubscriptionController {
 
     private final SubscriptionService subscriptionService;
+    private final PauseService pauseService;
     private final ClockService clock;
 
-    public SubscriptionController(SubscriptionService subscriptionService, ClockService clock) {
+    public SubscriptionController(SubscriptionService subscriptionService, PauseService pauseService,
+                                  ClockService clock) {
         this.subscriptionService = subscriptionService;
+        this.pauseService = pauseService;
         this.clock = clock;
     }
 
@@ -48,6 +52,31 @@ public class SubscriptionController {
         return changeView(pc);
     }
 
+    @PostMapping("/{id}/pause")
+    public Map<String, Object> pause(@PathVariable String id, @RequestBody Map<String, Object> req) {
+        return pauseView(pauseService.pause(id, str(req, "idempotencyKey"),
+                instant(req, "effectiveAt", clock.now())));
+    }
+
+    @PostMapping("/{id}/resume")
+    public Map<String, Object> resume(@PathVariable String id, @RequestBody Map<String, Object> req) {
+        return pauseView(pauseService.resume(id, str(req, "idempotencyKey"),
+                instant(req, "effectiveAt", clock.now())));
+    }
+
+    static Map<String, Object> pauseView(com.github.feng111627.usagebasedbillingjava.model.PauseRecord r) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("seq", r.getSeq());
+        m.put("subscriptionId", r.getSubscriptionId());
+        m.put("action", r.getAction());
+        m.put("effectiveAt", r.getEffectiveAt());
+        m.put("amount", r.getAmount());
+        m.put("periodKey", r.getPeriodKey());
+        m.put("planId", r.getPlanId());
+        m.put("invoiceId", r.getInvoiceId());
+        return m;
+    }
+
     @GetMapping("/{id}")
     public Map<String, Object> get(@PathVariable String id) {
         return toView(subscriptionService.getSubscription(id));
@@ -63,6 +92,7 @@ public class SubscriptionController {
         m.put("currentPeriodStart", s.getCurrentPeriodStart());
         m.put("currentPeriodEnd", s.getCurrentPeriodEnd());
         m.put("lastChangeSeq", s.getLastChangeSeq());
+        m.put("pausedSince", s.getPausedSince());
         return m;
     }
 

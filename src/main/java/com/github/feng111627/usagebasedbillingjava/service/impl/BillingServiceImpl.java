@@ -8,6 +8,7 @@ import com.github.feng111627.usagebasedbillingjava.model.Invoice;
 import com.github.feng111627.usagebasedbillingjava.model.InvoiceLine;
 import com.github.feng111627.usagebasedbillingjava.model.InvoiceStatus;
 import com.github.feng111627.usagebasedbillingjava.model.LineKind;
+import com.github.feng111627.usagebasedbillingjava.model.PauseRecord;
 import com.github.feng111627.usagebasedbillingjava.model.Plan;
 import com.github.feng111627.usagebasedbillingjava.model.PlanChange;
 import com.github.feng111627.usagebasedbillingjava.model.Subscription;
@@ -18,6 +19,7 @@ import com.github.feng111627.usagebasedbillingjava.repository.Repositories;
 import com.github.feng111627.usagebasedbillingjava.service.BillingCalendar;
 import com.github.feng111627.usagebasedbillingjava.service.ClockService;
 import com.github.feng111627.usagebasedbillingjava.service.Money;
+import com.github.feng111627.usagebasedbillingjava.service.PauseTimeline;
 import com.github.feng111627.usagebasedbillingjava.service.PaymentService;
 import com.github.feng111627.usagebasedbillingjava.service.PlanService;
 import com.github.feng111627.usagebasedbillingjava.service.SubscriptionLocks;
@@ -27,6 +29,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -59,6 +62,7 @@ public class BillingServiceImpl implements BillingService {
     private final Repositories.UsageEventRepository eventRepository;
     private final Repositories.ChangeRepository changeRepository;
     private final Repositories.PaymentRepository paymentRepository;
+    private final Repositories.PauseRepository pauseRepository;
     private final PlanService planService;
     private final PaymentService paymentService;
     private final BillingCalendar calendar;
@@ -71,6 +75,7 @@ public class BillingServiceImpl implements BillingService {
                               Repositories.UsageEventRepository eventRepository,
                               Repositories.ChangeRepository changeRepository,
                               Repositories.PaymentRepository paymentRepository,
+                              Repositories.PauseRepository pauseRepository,
                               PlanService planService, PaymentService paymentService,
                               BillingCalendar calendar, ClockService clock, SubscriptionLocks locks) {
         this.subscriptionRepository = subscriptionRepository;
@@ -79,6 +84,7 @@ public class BillingServiceImpl implements BillingService {
         this.eventRepository = eventRepository;
         this.changeRepository = changeRepository;
         this.paymentRepository = paymentRepository;
+        this.pauseRepository = pauseRepository;
         this.planService = planService;
         this.paymentService = paymentService;
         this.calendar = calendar;
@@ -110,6 +116,21 @@ public class BillingServiceImpl implements BillingService {
             UsageAccumulation acc = accumulationRepository.find(subscriptionId, periodKey, METER).orElse(null);
             Plan endingPlan = planAtPeriodEnd(sub, end);
 
+            // 本周期真正活跃（未处于客户主动暂停）的秒数与配额折算口径
+            List<PauseRecord> pauseRecords = pauseRepository.findBySubscription(subscriptionId);
+            List<PauseTimeline.Segment> segments = PauseTimeline.segments(pauseRecords, end);
+            long periodSeconds = Duration.between(start, end).getSeconds();
+            long activeSeconds = PauseTimeline.activeSeconds(segments, start, end);
+            BigDecimal activeRatio = periodSeconds <= 0 ? BigDecimal.ONE
+                    : BigDecimal.valueOf(activeSeconds)
+                            .divide(BigDecimal.valueOf(periodSeconds), 6, RoundingMode.HALF_UP);
+            // 配额按真正活跃时长等比例折算（暂停掉的时间不算在内），半秒以下 HALF_UP
+            long effectiveIncluded = new BigDecimal(endingPlan.getIncludedUnits())
+                    .multiply(activeRatio)
+                    .setScale(0, RoundingMode.HALF_UP)
+                    .longValueExact();
+            boolean whollyPaused = activeSeconds == 0;
+
             Invoice inv = new Invoice();
             inv.setInvoiceId("INV-" + subscriptionId + "-CYC-" + periodKey);
             inv.setSubscriptionId(subscriptionId);
@@ -120,29 +141,49 @@ public class BillingServiceImpl implements BillingService {
             inv.setCycle(true);
             inv.setPlanId(endingPlan.getPlanId());
 
+            if (whollyPaused) {
+                // 整个周期都处于客户主动暂停：不产生基础费/超配额费；无用量是暂停的确定结果，
+                // 绝不能误判为缺计量异常。出 0 元周期账单并正常滚动（订阅保持 PAUSED）。
+                inv.getLines().add(new InvoiceLine(LineKind.ADJUSTMENT,
+                        "整周期客户主动暂停，无基础费且无用量属确定结果（非缺计量）",
+                        BigDecimal.ZERO.setScale(2),
+                        "周期 " + start + " ~ " + end + " 活跃秒数=0（整周期暂停），活跃比例=0，"
+                                + "折算配额=0，不收基础费/超配额费；对账不得判缺计量"));
+                inv.setAmount(BigDecimal.ZERO.setScale(2));
+                inv.setStatus(InvoiceStatus.PAID);
+                inv.setPaidAt(now);
+                invoiceRepository.save(inv);
+                rolloverKeepingPause(sub, inv);
+                log.info("[close-period] 输入 sub={} period={}；判定依据：整周期客户主动暂停（活跃比例=0）-> 0 元、无异常、滚动并保持 PAUSED",
+                        subscriptionId, periodKey);
+                return invoiceRepository.findById(inv.getInvoiceId()).orElseThrow();
+            }
+
             if (acc == null || acc.isMissing()) {
-                // 缺计量：绝不悄悄按零，账单挂 ANOMALY，不计费、不滚动周期
+                // 缺计量（仅针对周期内存在活跃时长的情况）：绝不悄悄按零，账单挂 ANOMALY，不计费、不滚动周期
                 inv.setAmount(BigDecimal.ZERO.setScale(2));
                 inv.setStatus(InvoiceStatus.ANOMALY);
-                inv.setAnomalyReason("计量项 " + METER + " 在周期 " + periodKey + " 无任何上报（缺失），"
-                        + "需补报或由人工确认零用量；不得按零/上次值计价");
+                inv.setAnomalyReason("计量项 " + METER + " 在周期 " + periodKey + " 的活跃账段无任何上报（缺失），"
+                        + "活跃比例=" + activeRatio + "；需补报或由人工确认零用量；整周期暂停不算缺失");
                 invoiceRepository.save(inv);
-                log.warn("[close-period] 输入 sub={} period={}；判定依据：{} -> 账单 ANOMALY（不计费）",
-                        subscriptionId, periodKey, inv.getAnomalyReason());
+                log.warn("[close-period] 输入 sub={} period={}；判定依据：活跃比例={} 但 {} -> 账单 ANOMALY（不计费）",
+                        subscriptionId, periodKey, activeRatio, inv.getAnomalyReason());
                 return inv;
             }
 
             long used = acc.getTotal();
-            long overUnits = Math.max(0L, used - endingPlan.getIncludedUnits());
+            long overUnits = Math.max(0L, used - effectiveIncluded);
             BigDecimal overage = Money.mul(endingPlan.getOveragePrice(), overUnits);
             inv.getLines().add(new InvoiceLine(LineKind.OVERAGE,
                     "周期 " + periodKey + " 超配额 " + METER, overage,
-                    "用量=" + used + " 配额=" + endingPlan.getIncludedUnits()
-                            + " 超出=" + overUnits + " 单价=" + endingPlan.getOveragePrice()));
+                    "用量=" + used + " 套餐配额=" + endingPlan.getIncludedUnits()
+                            + " 活跃比例=" + activeRatio + "（活跃秒=" + activeSeconds + "/" + periodSeconds
+                            + "）折算配额=" + effectiveIncluded + " 超出=" + overUnits
+                            + " 单价=" + endingPlan.getOveragePrice()));
 
             BigDecimal total = overage;
             if (sub.getStatus() == SubscriptionStatus.ACTIVE) {
-                // 下一周期基础费按订阅当前套餐预收（中途差价已由 PRORATION 账单结清，此处不重复）
+                // 下一周期基础费按订阅当前套餐预收（中途差价/暂停结算已由独立账单结清，此处不重复）
                 Plan nextPlan = planService.getPlan(sub.getCurrentPlanId());
                 BigDecimal nextBase = Money.of(nextPlan.getBasePrice());
                 Instant ns = end;
@@ -158,9 +199,18 @@ public class BillingServiceImpl implements BillingService {
             inv.setAmount(Money.of(total));
             inv.setStatus(InvoiceStatus.PENDING);
             invoiceRepository.save(inv);
-            log.info("[close-period] 输入 sub={} period={}；判定依据：plan={} 用量={} 配额={} 超量={} 超配额费={}；账单金额={} PENDING",
-                    subscriptionId, periodKey, endingPlan.getPlanId(), used,
-                    endingPlan.getIncludedUnits(), overUnits, overage, inv.getAmount());
+            log.info("[close-period] 输入 sub={} period={}；判定依据：plan={} 用量={} 活跃比例={} 折算配额={} 超量={} 超配额费={}；账单金额={} PENDING",
+                    subscriptionId, periodKey, endingPlan.getPlanId(), used, activeRatio,
+                    effectiveIncluded, overUnits, overage, inv.getAmount());
+
+            if (total.signum() == 0) {
+                // 暂停后恢复且本周期用量未超折算配额：无基础费（暂停/恢复已比例结算）、无超配额，0 元直接收讫滚动
+                inv.setStatus(InvoiceStatus.PAID);
+                inv.setPaidAt(now);
+                invoiceRepository.save(inv);
+                rolloverKeepingPause(sub, inv);
+                return invoiceRepository.findById(inv.getInvoiceId()).orElseThrow();
+            }
 
             // 出账收款失败：账单落 FAILED（可解释的确定状态），同时把 GATEWAY_REJECTED 抛给调用方分类处理
             try {
@@ -178,6 +228,25 @@ public class BillingServiceImpl implements BillingService {
             }
             return invoiceRepository.findById(inv.getInvoiceId()).orElseThrow();
         });
+    }
+
+    /** 周期滚动：已收款周期推进到下一周期，但客户主动暂停态必须保持 PAUSED，不得被滚成 ACTIVE。 */
+    private void rolloverKeepingPause(Subscription sub, Invoice inv) {
+        if (!inv.isCycle() || inv.getStatus() != InvoiceStatus.PAID) {
+            return;
+        }
+        if (!inv.getPeriodStart().equals(sub.getCurrentPeriodStart())) {
+            return;
+        }
+        boolean keepPaused = sub.getStatus() == SubscriptionStatus.PAUSED;
+        Instant ns = inv.getPeriodEnd();
+        Instant ne = calendar.nextPeriodStart(ns, sub.getAnchorDay());
+        sub.setCurrentPeriodStart(ns);
+        sub.setCurrentPeriodEnd(ne);
+        sub.setStatus(keepPaused ? SubscriptionStatus.PAUSED : SubscriptionStatus.ACTIVE);
+        subscriptionRepository.save(sub);
+        log.info("[rollover] sub={} 周期账单 {} 收讫 -> 滚动到新周期 {} ~ {}，订阅状态保持 {}",
+                sub.getSubscriptionId(), inv.getInvoiceId(), ns, ne, sub.getStatus());
     }
 
     @Override
@@ -245,11 +314,21 @@ public class BillingServiceImpl implements BillingService {
             Plan plan = planService.getPlan(inv.getPlanId() != null ? inv.getPlanId()
                     : require(inv.getSubscriptionId()).getCurrentPlanId());
 
-            // 重算该周期总用量与超配额（含本次迟到事件，累计行已含它），得到相对原账单的补计差额
+            // 重算该周期总用量与超配额（含本次迟到事件，累计行已含它），得到相对原账单的补计差额。
+            // 配额按该周期真正活跃时长折算（暂停掉的时间不算），与出账口径一致、可对账。
             UsageAccumulation acc = accumulationRepository
                     .find(inv.getSubscriptionId(), inv.getPeriodKey(), METER).orElse(null);
             long usedTotal = acc != null ? acc.getTotal() : ev.getQuantity();
-            long overUnits = Math.max(0L, usedTotal - plan.getIncludedUnits());
+            List<PauseRecord> latePauseRecords = pauseRepository.findBySubscription(inv.getSubscriptionId());
+            List<PauseTimeline.Segment> lateSegments = PauseTimeline.segments(latePauseRecords, inv.getPeriodEnd());
+            long lateActiveSec = PauseTimeline.activeSeconds(lateSegments, inv.getPeriodStart(), inv.getPeriodEnd());
+            long latePeriodSec = Duration.between(inv.getPeriodStart(), inv.getPeriodEnd()).getSeconds();
+            BigDecimal lateActiveRatio = latePeriodSec <= 0 ? BigDecimal.ONE
+                    : BigDecimal.valueOf(lateActiveSec)
+                            .divide(BigDecimal.valueOf(latePeriodSec), 6, RoundingMode.HALF_UP);
+            long effectiveIncluded = new BigDecimal(plan.getIncludedUnits())
+                    .multiply(lateActiveRatio).setScale(0, RoundingMode.HALF_UP).longValueExact();
+            long overUnits = Math.max(0L, usedTotal - effectiveIncluded);
             BigDecimal correctedOverage = Money.mul(plan.getOveragePrice(), overUnits);
             BigDecimal priorOverage = inv.getLines().stream()
                     .filter(l -> l.getKind() == LineKind.OVERAGE)
@@ -259,8 +338,8 @@ public class BillingServiceImpl implements BillingService {
             InvoiceLine line = new InvoiceLine(LineKind.ADJUSTMENT,
                     "迟到用量补计 eventId=" + eventId, extra,
                     "eventId=" + eventId + " qty=" + ev.getQuantity() + " 周期总用量=" + usedTotal
-                            + " 配额=" + plan.getIncludedUnits() + " 重算超配额费=" + correctedOverage
-                            + " 原超配额费=" + priorOverage);
+                            + " 活跃比例=" + lateActiveRatio + " 折算配额=" + effectiveIncluded
+                            + " 重算超配额费=" + correctedOverage + " 原超配额费=" + priorOverage);
 
             if (inv.getStatus() == InvoiceStatus.PAID) {
                 // 已付账单：原账单金额与明细完全不动，另立一张调整账单即时补收（对账口径清晰、可解释）
@@ -303,6 +382,13 @@ public class BillingServiceImpl implements BillingService {
     public Invoice runBillingTick(String subscriptionId) {
         Subscription sub = require(subscriptionId);
         return locks.withLock(subscriptionId, () -> {
+            if (sub.getStatus() == SubscriptionStatus.PAUSED) {
+                // 客户主动暂停与收款失败停用互不相干：暂停期不驱动任何收款状态机
+                log.info("[tick] sub={} 处于客户主动暂停 PAUSED，tick 不做收款推进（区别于 SUSPENDED）", subscriptionId);
+                return invoiceRepository.findBySubscription(subscriptionId).stream()
+                        .filter(Invoice::isCycle)
+                        .reduce((a, b) -> b).orElse(null);
+            }
             Invoice inv = latestCycleInvoice(subscriptionId);
             if (inv == null) {
                 throw new BillingException(ErrorCode.NOTHING_TO_CLOSE,
@@ -405,18 +491,19 @@ public class BillingServiceImpl implements BillingService {
         if (!inv.isCycle() || inv.getStatus() != InvoiceStatus.PAID) {
             return;
         }
-        // 账单周期 == 订阅当前所处周期时，收款完成即把订阅推进到下一周期
+        // 账单周期 == 订阅当前周期时，收款完成即把订阅推进到下一周期
         if (!inv.getPeriodStart().equals(sub.getCurrentPeriodStart())) {
             return;
         }
+        boolean keepPaused = sub.getStatus() == SubscriptionStatus.PAUSED;
         Instant ns = inv.getPeriodEnd();
         Instant ne = calendar.nextPeriodStart(ns, sub.getAnchorDay());
         sub.setCurrentPeriodStart(ns);
         sub.setCurrentPeriodEnd(ne);
-        sub.setStatus(SubscriptionStatus.ACTIVE);
+        sub.setStatus(keepPaused ? SubscriptionStatus.PAUSED : SubscriptionStatus.ACTIVE);
         subscriptionRepository.save(sub);
-        log.info("[rollover] sub={} 周期账单 {} 收讫 -> 滚动到新周期 {} ~ {}，订阅 ACTIVE",
-                sub.getSubscriptionId(), inv.getInvoiceId(), ns, ne);
+        log.info("[rollover] sub={} 周期账单 {} 收讫 -> 滚动到新周期 {} ~ {}，订阅状态 {}",
+                sub.getSubscriptionId(), inv.getInvoiceId(), ns, ne, sub.getStatus());
     }
 
     private Invoice latestCycleInvoice(String subscriptionId) {

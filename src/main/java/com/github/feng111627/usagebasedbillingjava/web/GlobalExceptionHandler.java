@@ -27,6 +27,8 @@ public class GlobalExceptionHandler {
     private static final Set<ErrorCode> CONFLICT = Set.of(
             ErrorCode.DUPLICATE_REQUEST, ErrorCode.CHANGE_OUT_OF_ORDER,
             ErrorCode.SUBSCRIPTION_INACTIVE, ErrorCode.SUBSCRIPTION_SUSPENDED,
+            ErrorCode.SUBSCRIPTION_PAUSED_BY_CUSTOMER, ErrorCode.USAGE_DURING_PAUSE,
+            ErrorCode.REFUND_LIMIT_EXCEEDED,
             ErrorCode.CONFLICT, ErrorCode.NOTHING_TO_CLOSE,
             ErrorCode.INVOICE_ALREADY_PAID);
 

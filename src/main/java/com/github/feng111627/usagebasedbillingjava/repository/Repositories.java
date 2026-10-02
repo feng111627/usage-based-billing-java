@@ -3,6 +3,7 @@ package com.github.feng111627.usagebasedbillingjava.repository;
 import com.github.feng111627.usagebasedbillingjava.model.Invoice;
 import com.github.feng111627.usagebasedbillingjava.model.LedgerTransaction;
 import com.github.feng111627.usagebasedbillingjava.model.PaymentAttempt;
+import com.github.feng111627.usagebasedbillingjava.model.PauseRecord;
 import com.github.feng111627.usagebasedbillingjava.model.Plan;
 import com.github.feng111627.usagebasedbillingjava.model.PlanChange;
 import com.github.feng111627.usagebasedbillingjava.model.Subscription;
@@ -71,5 +72,13 @@ public final class Repositories {
         LedgerTransaction save(LedgerTransaction tx);
         Optional<LedgerTransaction> findByIdempotencyKey(String key);
         List<LedgerTransaction> findAll();
+    }
+
+    /** 客户主动暂停/恢复记录。按 seq 升序返回，构成与升降配共用的订阅级全序。 */
+    public interface PauseRepository {
+        PauseRecord save(PauseRecord record);
+        List<PauseRecord> findBySubscription(String subscriptionId);
+        Optional<PauseRecord> findByIdempotencyKey(String key);
+        List<PauseRecord> findAll();
     }
 }

@@ -8,6 +8,7 @@ import com.github.feng111627.usagebasedbillingjava.model.InvoiceLine;
 import com.github.feng111627.usagebasedbillingjava.model.LineKind;
 import com.github.feng111627.usagebasedbillingjava.model.Plan;
 import com.github.feng111627.usagebasedbillingjava.model.PlanChange;
+import com.github.feng111627.usagebasedbillingjava.model.PauseRecord;
 import com.github.feng111627.usagebasedbillingjava.model.Subscription;
 import com.github.feng111627.usagebasedbillingjava.model.SubscriptionStatus;
 import com.github.feng111627.usagebasedbillingjava.repository.Repositories;
@@ -45,6 +46,7 @@ public class SubscriptionServiceImpl implements SubscriptionService {
 
     private final Repositories.SubscriptionRepository subscriptionRepository;
     private final Repositories.ChangeRepository changeRepository;
+    private final Repositories.PauseRepository pauseRepository;
     private final Repositories.InvoiceRepository invoiceRepository;
     private final PlanService planService;
     private final PaymentService paymentService;
@@ -54,6 +56,7 @@ public class SubscriptionServiceImpl implements SubscriptionService {
 
     public SubscriptionServiceImpl(Repositories.SubscriptionRepository subscriptionRepository,
                                    Repositories.ChangeRepository changeRepository,
+                                   Repositories.PauseRepository pauseRepository,
                                    Repositories.InvoiceRepository invoiceRepository,
                                    PlanService planService,
                                    PaymentService paymentService,
@@ -62,6 +65,7 @@ public class SubscriptionServiceImpl implements SubscriptionService {
                                    SubscriptionLocks locks) {
         this.subscriptionRepository = subscriptionRepository;
         this.changeRepository = changeRepository;
+        this.pauseRepository = pauseRepository;
         this.invoiceRepository = invoiceRepository;
         this.planService = planService;
         this.paymentService = paymentService;
@@ -175,6 +179,11 @@ public class SubscriptionServiceImpl implements SubscriptionService {
         if (s.getStatus() == SubscriptionStatus.CANCELLED) {
             throw new BillingException(ErrorCode.SUBSCRIPTION_INACTIVE, "订阅已退订: " + subscriptionId);
         }
+        if (s.getStatus() == SubscriptionStatus.PAUSED) {
+            // 客户主动暂停态退订：暂停时剩余周期预付基础费已按比例退回，此处不再退第二遍，
+            // 直接终态 CANCELLED，并记一条 0 元退订以保留全序与留痕。
+            return cancelWhilePaused(s, key, requestedAt);
+        }
         requireActive(s);
         Plan from = planService.getPlan(s.getCurrentPlanId());
         return applyChange(s, from, null, key, requestedAt);
@@ -182,14 +191,19 @@ public class SubscriptionServiceImpl implements SubscriptionService {
 
     private PlanChange applyChange(Subscription s, Plan from, Plan to, String key, Instant requestedAt) {
         Instant eff = requestedAt != null ? requestedAt : clock.now();
-        if (s.getLastChangeSeq() > 0) {
-            PlanChange last = changeRepository.findBySubscription(s.getSubscriptionId())
-                    .stream().reduce((a, b) -> b).orElseThrow();
-            if (eff.isBefore(last.getEffectiveAt())) {
-                throw new BillingException(ErrorCode.CHANGE_OUT_OF_ORDER,
-                        "变更生效时间 " + eff + " 早于上一次变更 " + last.getEffectiveAt()
-                                + "（seq=" + last.getSeq() + "），乱序请求被拒绝");
-            }
+        Instant lastChange = s.getLastChangeSeq() > 0
+                ? changeRepository.findBySubscription(s.getSubscriptionId())
+                        .stream().reduce((a, b) -> b).map(PlanChange::getEffectiveAt).orElse(null)
+                : null;
+        Instant lastPause = pauseRepository.findBySubscription(s.getSubscriptionId())
+                .stream().map(PauseRecord::getEffectiveAt)
+                .reduce((a, b) -> a.isAfter(b) ? a : b).orElse(null);
+        Instant last = lastPause != null && (lastChange == null || lastPause.isAfter(lastChange))
+                ? lastPause : lastChange;
+        if (last != null && !eff.isAfter(last)) {
+            throw new BillingException(ErrorCode.CHANGE_OUT_OF_ORDER,
+                    "变更生效时间 " + eff + " 不晚于上一次升降配/暂停/恢复 " + last
+                            + "，同一时刻仅允许一个操作生效，乱序/并发请求被拒绝");
         }
         if (eff.isBefore(s.getCurrentPeriodStart()) || !eff.isBefore(s.getCurrentPeriodEnd())) {
             throw new BillingException(ErrorCode.VALIDATION,
@@ -258,6 +272,44 @@ public class SubscriptionServiceImpl implements SubscriptionService {
         return requireSubscription(subscriptionId);
     }
 
+    /** 客户主动暂停态退订：剩余周期基础费已在暂停时退过，此处 0 元留痕，绝不二次退款。 */
+    private PlanChange cancelWhilePaused(Subscription s, String key, Instant requestedAt) {
+        Instant eff = requestedAt != null ? requestedAt : clock.now();
+        Instant lastPause = pauseRepository.findBySubscription(s.getSubscriptionId()).stream()
+                .map(PauseRecord::getEffectiveAt).reduce((a, b) -> a.isAfter(b) ? a : b).orElse(null);
+        if (lastPause != null && !eff.isAfter(lastPause)) {
+            throw new BillingException(ErrorCode.CHANGE_OUT_OF_ORDER,
+                    "退订生效时间 " + eff + " 不晚于上一次暂停/恢复 " + lastPause + "，乱序请求被拒绝");
+        }
+        Plan from = planService.getPlan(s.getCurrentPlanId());
+        long seq = s.getLastChangeSeq() + 1;
+        BigDecimal zero = BigDecimal.ZERO.setScale(2);
+        Invoice invoice = buildProrationInvoice(s, seq, zero,
+                "客户主动暂停态退订（暂停时已按比例退回剩余基础费，不再二次退款）",
+                "暂停中退订 eff=" + eff + " 已退款见暂停账单，本次差价=0.00");
+        invoiceRepository.save(invoice);
+
+        PlanChange pc = new PlanChange();
+        pc.setSeq(seq);
+        pc.setSubscriptionId(s.getSubscriptionId());
+        pc.setType(ChangeType.CANCEL);
+        pc.setFromPlanId(from.getPlanId());
+        pc.setToPlanId(null);
+        pc.setEffectiveAt(eff);
+        pc.setProration(zero);
+        pc.setInvoiceId(invoice.getInvoiceId());
+        pc.setIdempotencyKey(key);
+        changeRepository.save(pc);
+
+        s.setLastChangeSeq(seq);
+        s.setStatus(SubscriptionStatus.CANCELLED);
+        s.setPausedSince(null);
+        subscriptionRepository.save(s);
+        log.info("[cancel-paused] sub={} key={} eff={} seq={}；判定依据：暂停态退订不二次退款，订阅 CANCELLED",
+                s.getSubscriptionId(), key, eff, seq);
+        return pc;
+    }
+
     private Invoice buildProrationInvoice(Subscription s, long seq, BigDecimal amount, String desc, String basis) {
         Invoice inv = new Invoice();
         inv.setInvoiceId("INV-" + s.getSubscriptionId() + "-CHG" + seq);
@@ -286,7 +338,9 @@ public class SubscriptionServiceImpl implements SubscriptionService {
             case PAST_DUE -> throw new BillingException(ErrorCode.CONFLICT,
                     "订阅处于宽限期（存在未收账单），结清后才能变更: " + s.getSubscriptionId());
             case SUSPENDED -> throw new BillingException(ErrorCode.SUBSCRIPTION_SUSPENDED,
-                    "订阅已暂停，补缴恢复后才能变更: " + s.getSubscriptionId());
+                    "订阅因收款失败停用，补缴恢复后才能变更: " + s.getSubscriptionId());
+            case PAUSED -> throw new BillingException(ErrorCode.SUBSCRIPTION_PAUSED_BY_CUSTOMER,
+                    "订阅已由客户主动暂停，恢复后才能变更套餐: " + s.getSubscriptionId());
             case CANCELLED -> throw new BillingException(ErrorCode.SUBSCRIPTION_INACTIVE,
                     "订阅已退订: " + s.getSubscriptionId());
         }
