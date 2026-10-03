@@ -99,7 +99,8 @@ class MidCyclePlanChangeTest {
         clock.advanceTo(Instant.parse("2026-09-01T00:00:00Z"));
         subscriptions.subscribe("sub-p3", "cust-p3", "BASIC", 1);
         // 同一时刻 8 个并发的 BASIC->PRO（各自携带不同幂等键）：
-        // 分段锁 + seq 全序保证仅 1 个生效，其余在锁内看到“当前套餐已是 PRO”被 VALIDATION 可解释拒绝。
+        // 分段锁 + seq 全序保证仅 1 个生效，其余在锁内看到“同一生效时间点已有操作生效”
+        // 被 EFFECTIVE_TIME_CONFLICT 可解释拒绝（与 VALIDATION/CHANGE_OUT_OF_ORDER 均可区分）。
         int n = 8;
         ExecutorService pool = Executors.newFixedThreadPool(n);
         CountDownLatch start = new CountDownLatch(1);
@@ -124,8 +125,8 @@ class MidCyclePlanChangeTest {
         assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
 
         long ok = outcomes.stream().filter(o -> o.startsWith("OK")).count();
-        long rejected = outcomes.stream().filter(o -> o.startsWith("VALIDATION")).count();
-        log.info("[race] 输入：同一时刻 {} 个并发变更 BASIC->PRO；判定依据：仅 1 个成功，其余因已为 PRO 被可解释拒绝；成功={} 拒绝={}",
+        long rejected = outcomes.stream().filter(o -> o.startsWith("EFFECTIVE_TIME_CONFLICT")).count();
+        log.info("[race] 输入：同一时刻 {} 个并发变更 BASIC->PRO；判定依据：仅 1 个成功，其余因该生效时间点已被占用（EFFECTIVE_TIME_CONFLICT）被拒；成功={} 拒绝={}",
                 n, ok, rejected);
         assertEquals(1, ok, "同一时刻只能有一次变更生效（全序）");
         assertEquals(n - 1, rejected);

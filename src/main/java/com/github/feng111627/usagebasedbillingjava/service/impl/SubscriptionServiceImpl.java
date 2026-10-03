@@ -34,6 +34,9 @@ import java.util.UUID;
  *   <li>同一订阅的变更在 {@link SubscriptionLocks} 内串行，seq 单调递增形成全序，
  *       同一时刻到达的多次变更严格按接收顺序计价；</li>
  *   <li>effectiveAt 早于上一次变更的请求直接判 CHANGE_OUT_OF_ORDER 拒绝，杜绝乱序覆盖；</li>
+ *   <li><b>effectiveAt 等于上一次已生效变更的请求判 EFFECTIVE_TIME_CONFLICT 当场拒绝</b>：
+ *       同一生效时间点对同一条订阅最多只有一个操作（升降配/暂停/恢复/退订）真正生效，
+ *       被拒请求在出账与通道结算之前即被拦截，不产生任何退款/扣款、不推进 seq、不改状态与套餐；</li>
  *   <li>差价立即通过本地通道结清，通道失败则整体不落库（无中间态），重试由幂等键兜底；</li>
  *   <li>差价 = (新基础价 - 旧基础价) × 剩余周期比例（6 位比例、金额 HALF_UP 到分）。</li>
  * </ul>
@@ -145,7 +148,11 @@ public class SubscriptionServiceImpl implements SubscriptionService {
                     key, pc.getSeq(), pc.getProration());
             return pc;
         }
+        // 生效时间互斥判定先于状态/套餐校验与一切资金动作：
+        // 同一生效时间点已有操作生效则当场拒绝，保证拒绝不留下任何账单或状态痕迹。
+        Instant eff = resolveEffectiveAt(s, requestedAt);
         requireActive(s);
+        requireInCurrentPeriod(s, eff);
         if (targetPlanId == null) {
             throw new BillingException(ErrorCode.VALIDATION, "targetPlanId 不能为空");
         }
@@ -154,7 +161,7 @@ public class SubscriptionServiceImpl implements SubscriptionService {
         }
         Plan from = planService.getPlan(s.getCurrentPlanId());
         Plan to = planService.getPlan(targetPlanId);
-        return applyChange(s, from, to, key, requestedAt);
+        return applyChange(s, from, to, key, eff);
     }
 
     private PlanChange doCancel(String subscriptionId, String key, Instant requestedAt) {
@@ -172,16 +179,18 @@ public class SubscriptionServiceImpl implements SubscriptionService {
             log.info("[cancel] 幂等重放 key={} -> 返回原退订结果", key);
             return pc;
         }
+        // 生效时间互斥判定先于状态校验与退款：同刻已有操作生效时当场拒绝，不退一分钱、不改状态。
+        Instant eff = resolveEffectiveAt(s, requestedAt);
         if (s.getStatus() == SubscriptionStatus.CANCELLED) {
             throw new BillingException(ErrorCode.SUBSCRIPTION_INACTIVE, "订阅已退订: " + subscriptionId);
         }
         requireActive(s);
+        requireInCurrentPeriod(s, eff);
         Plan from = planService.getPlan(s.getCurrentPlanId());
-        return applyChange(s, from, null, key, requestedAt);
+        return applyChange(s, from, null, key, eff);
     }
 
-    private PlanChange applyChange(Subscription s, Plan from, Plan to, String key, Instant requestedAt) {
-        Instant eff = validateEffectiveAt(s, requestedAt);
+    private PlanChange applyChange(Subscription s, Plan from, Plan to, String key, Instant eff) {
         BigDecimal ratio = calendar.remainingRatio(eff, s.getCurrentPeriodStart(), s.getCurrentPeriodEnd());
         ChangeType type;
         BigDecimal delta;
@@ -264,6 +273,8 @@ public class SubscriptionServiceImpl implements SubscriptionService {
             log.info("[pause] 幂等重放 key={} seq={} -> 返回原暂停结果，不重复退款", key, pc.getSeq());
             return pc;
         }
+        // 生效时间互斥判定先于状态校验与退款：同刻已有操作生效时当场拒绝，不退一分钱、不改状态。
+        Instant eff = resolveEffectiveAt(s, requestedAt);
         switch (s.getStatus()) {
             case ACTIVE -> { }
             case PAUSED -> throw new BillingException(ErrorCode.SUBSCRIPTION_PAUSED,
@@ -275,8 +286,8 @@ public class SubscriptionServiceImpl implements SubscriptionService {
             case CANCELLED -> throw new BillingException(ErrorCode.SUBSCRIPTION_INACTIVE,
                     "订阅已退订: " + subscriptionId);
         }
+        requireInCurrentPeriod(s, eff);
         Plan plan = planService.getPlan(s.getCurrentPlanId());
-        Instant eff = validateEffectiveAt(s, requestedAt);
         BigDecimal ratio = calendar.remainingRatio(eff, s.getCurrentPeriodStart(), s.getCurrentPeriodEnd());
         // 暂停：按暂停时刻到周期末的剩余比例退回本周期已预付但未消耗的基础费
         BigDecimal delta = Money.prorate(plan.getBasePrice().negate(), ratio);
@@ -301,6 +312,8 @@ public class SubscriptionServiceImpl implements SubscriptionService {
             log.info("[resume] 幂等重放 key={} seq={} -> 返回原恢复结果，不重复扣款", key, pc.getSeq());
             return pc;
         }
+        // 生效时间互斥判定先于状态校验与扣款：同刻已有操作生效时当场拒绝，不扣一分钱、不改状态。
+        Instant eff = resolveEffectiveAt(s, requestedAt);
         switch (s.getStatus()) {
             case PAUSED -> { }
             case ACTIVE -> throw new BillingException(ErrorCode.CONFLICT,
@@ -312,8 +325,8 @@ public class SubscriptionServiceImpl implements SubscriptionService {
             case CANCELLED -> throw new BillingException(ErrorCode.SUBSCRIPTION_INACTIVE,
                     "订阅已退订: " + subscriptionId);
         }
+        requireInCurrentPeriod(s, eff);
         Plan plan = planService.getPlan(s.getCurrentPlanId());
-        Instant eff = validateEffectiveAt(s, requestedAt);
         BigDecimal ratio = calendar.remainingRatio(eff, s.getCurrentPeriodStart(), s.getCurrentPeriodEnd());
         // 恢复：按恢复时刻到周期末的剩余比例重新收取本周期基础费
         BigDecimal delta = Money.prorate(plan.getBasePrice(), ratio);
@@ -359,8 +372,18 @@ public class SubscriptionServiceImpl implements SubscriptionService {
         return pc;
     }
 
-    /** 生效时间校验：不得早于上一次变更（乱序拒绝），且必须落在当前周期内。 */
-    private Instant validateEffectiveAt(Subscription s, Instant requestedAt) {
+    /**
+     * 第一层生效时间校验（在状态校验、出账与通道结算之前执行）：
+     * 相对上一次已生效变更，生效时间不允许早于、也不允许等于。
+     * <ul>
+     *   <li>早于上一次变更 -> CHANGE_OUT_OF_ORDER（乱序拒绝）；</li>
+     *   <li><b>等于</b>上一次变更 -> EFFECTIVE_TIME_CONFLICT：同一生效时间点对同一条订阅
+     *       最多只有一个操作真正生效，先到者占位，后到者当场拒绝（不出账、不走资金、不动状态）；</li>
+     *   <li>晚于上一次变更 -> 正常继续。</li>
+     * </ul>
+     * 变更按订阅串行（{@link SubscriptionLocks}），故只需比对全序中的最后一条。
+     */
+    private Instant resolveEffectiveAt(Subscription s, Instant requestedAt) {
         Instant eff = requestedAt != null ? requestedAt : clock.now();
         if (s.getLastChangeSeq() > 0) {
             PlanChange last = changeRepository.findBySubscription(s.getSubscriptionId())
@@ -370,13 +393,27 @@ public class SubscriptionServiceImpl implements SubscriptionService {
                         "变更生效时间 " + eff + " 早于上一次变更 " + last.getEffectiveAt()
                                 + "（seq=" + last.getSeq() + "），乱序请求被拒绝");
             }
+            if (eff.equals(last.getEffectiveAt())) {
+                throw new BillingException(ErrorCode.EFFECTIVE_TIME_CONFLICT,
+                        "订阅 " + s.getSubscriptionId() + " 在生效时间 " + eff
+                                + " 已有一次操作生效（seq=" + last.getSeq() + "，类型=" + last.getType()
+                                + "）；同一生效时间点最多允许一个操作生效，本次请求被拒绝，"
+                                + "不产生退款/扣款，订阅状态与套餐维持不变");
+            }
         }
+        return eff;
+    }
+
+    /**
+     * 第二层生效时间校验（在状态校验通过之后、计价之前执行）：生效时间必须落在当前周期内。
+     * 放在状态校验之后以保持既有错误优先级（例如 SUSPENDED 订阅先报 SUBSCRIPTION_SUSPENDED）。
+     */
+    private void requireInCurrentPeriod(Subscription s, Instant eff) {
         if (eff.isBefore(s.getCurrentPeriodStart()) || !eff.isBefore(s.getCurrentPeriodEnd())) {
             throw new BillingException(ErrorCode.VALIDATION,
                     "生效时间 " + eff + " 不在当前周期 [" + s.getCurrentPeriodStart() + ","
                             + s.getCurrentPeriodEnd() + ") 内");
         }
-        return eff;
     }
 
     @Override

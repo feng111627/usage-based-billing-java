@@ -214,7 +214,8 @@ class PauseResumeTest {
         clock.advanceTo(Instant.parse("2026-09-01T00:00:00Z"));
         subscriptions.subscribe("sub-pause6", "cust-p6", "BASIC", 1);
 
-        // 第一阶段：8 个并发暂停（不同幂等键、同一生效时刻）-> 恰好 1 个生效，其余 SUBSCRIPTION_PAUSED
+        // 第一阶段：8 个并发暂停（不同幂等键、同一生效时刻）-> 恰好 1 个生效，
+        // 其余在出账/退款之前即被 EFFECTIVE_TIME_CONFLICT 拒绝（同一生效时间点只允许一个操作生效）。
         int n = 8;
         ConcurrentLinkedQueue<String> pauseOutcomes = runConcurrent(n, i -> {
             subscriptions.pause("sub-pause6", "race-pause-" + i, Instant.parse("2026-09-10T00:00:00Z"));
@@ -222,20 +223,21 @@ class PauseResumeTest {
         });
         long pauseOk = pauseOutcomes.stream().filter("OK"::equals).count();
         long pauseRejected = pauseOutcomes.stream()
-                .filter(o -> o.equals(ErrorCode.SUBSCRIPTION_PAUSED.name())).count();
-        log.info("[case] 判定：并发暂停结果={}（恰好 1 个 OK，其余 SUBSCRIPTION_PAUSED）", pauseOutcomes);
+                .filter(o -> o.equals(ErrorCode.EFFECTIVE_TIME_CONFLICT.name())).count();
+        log.info("[case] 判定：并发暂停结果={}（恰好 1 个 OK，其余 EFFECTIVE_TIME_CONFLICT，拒绝无退款/无状态残留）", pauseOutcomes);
         assertEquals(1, pauseOk, "并发暂停只能有一个生效: " + pauseOutcomes);
         assertEquals(n - 1, pauseRejected);
         assertEquals(SubscriptionStatus.PAUSED, subscriptions.getSubscription("sub-pause6").getStatus());
 
-        // 第二阶段：8 个并发恢复 -> 恰好 1 个生效，其余 CONFLICT（已恢复活跃）
+        // 第二阶段：8 个并发恢复（生效时刻 9/15，与第一阶段错开）-> 恰好 1 个生效，其余 EFFECTIVE_TIME_CONFLICT
         ConcurrentLinkedQueue<String> resumeOutcomes = runConcurrent(n, i -> {
             subscriptions.resume("sub-pause6", "race-resume-" + i, Instant.parse("2026-09-15T00:00:00Z"));
             return "OK";
         });
         long resumeOk = resumeOutcomes.stream().filter("OK"::equals).count();
-        long resumeRejected = resumeOutcomes.stream().filter(o -> o.equals(ErrorCode.CONFLICT.name())).count();
-        log.info("[case] 判定：并发恢复结果={}（恰好 1 个 OK，其余 CONFLICT）", resumeOutcomes);
+        long resumeRejected = resumeOutcomes.stream()
+                .filter(o -> o.equals(ErrorCode.EFFECTIVE_TIME_CONFLICT.name())).count();
+        log.info("[case] 判定：并发恢复结果={}（恰好 1 个 OK，其余 EFFECTIVE_TIME_CONFLICT，拒绝无扣款/无状态残留）", resumeOutcomes);
         assertEquals(1, resumeOk, "并发恢复只能有一个生效: " + resumeOutcomes);
         assertEquals(n - 1, resumeRejected);
         assertEquals(SubscriptionStatus.ACTIVE, subscriptions.getSubscription("sub-pause6").getStatus());
