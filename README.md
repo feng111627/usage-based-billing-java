@@ -91,8 +91,9 @@ PENDING/FAILED/PAST_DUE ──扣款成功──▶ PAID
 
 ### 2.4 与既有能力的关系与兼容范围
 - **与升降配/退订**：暂停/恢复复用同一 `PlanChange` 流水与 seq 全序、同一订阅锁、同一幂等键体系；
-  `PAUSED` 中变更/退订被 `SUBSCRIPTION_PAUSED` 拒绝，须先恢复；乱序（`effectiveAt` 早于上次变更）同样
-  `CHANGE_OUT_OF_ORDER` 拒绝。
+  `PAUSED` 中变更/退订被 `SUBSCRIPTION_PAUSED` 拒绝，须先恢复；乱序（`effectiveAt` 早于上次变更）
+  `CHANGE_OUT_OF_ORDER` 拒绝；`effectiveAt` 与上次变更**相同**则 `EFFECTIVE_AT_CONFLICT` 拒绝
+  （同一生效时间点只允许一个操作生效，见 3.1）。
 - **与出账**：出账时配额按活跃比例折算（无暂停的周期比例为 1，行为与此前完全一致，向后兼容）；
   暂停中不预收基础费；整周期暂停不判计量异常。
 - **与收款失败停用（SUSPENDED）**：两者是不同枚举值、不同错误码、不同恢复路径
@@ -108,6 +109,21 @@ PENDING/FAILED/PAST_DUE ──扣款成功──▶ PAID
 - 每个订阅一把分段锁（`SubscriptionLocks`），同一订阅的变更/上报/出账/收款**串行**，不同订阅互不阻塞；
 - 每次变更 `seq` 单调递增形成**全序**：同一时刻到达的多次变更严格按接收顺序计价，只有一次生效，其余被可解释地拒绝，**无中间态残留**；
 - `effectiveAt` 早于上一次变更的请求判 `CHANGE_OUT_OF_ORDER` 拒绝（乱序不覆盖）；
+- `effectiveAt` 与上一次变更**相同**的请求判 `EFFECTIVE_AT_CONFLICT` 拒绝：**同一生效时间点
+  对同一订阅最多只有一个操作（暂停/恢复/升降配/退订）真正生效**。拒绝先于任何账单、
+  退款/扣款与状态推进，被拒后订阅状态、当前套餐、已生效操作的金额与被拒前完全一致，
+  同一时刻不会出现既退款又扣款的两头走账；
+- **同一生效时间点只允许一个操作生效**：`effectiveAt` 与上一次变更（暂停/恢复/升降配/退订，
+  共用同一 `PlanChange` 流水）**相同**的请求判 `EFFECTIVE_AT_CONFLICT`（409）拒绝。
+  - 拒绝发生在任何账单/退款/扣款/状态推进**之前**：被拒请求不产生任何资金流水、
+    不推进 `seq`，订阅状态、当前套餐、已生效操作的金额与被拒前完全一致，
+    同一时刻不会出现既退款又扣款的两头走账；
+  - 与 `CHANGE_OUT_OF_ORDER`（乱序）、`SUBSCRIPTION_PAUSED` 等状态类错误是**不同错误码**，
+    调用方可明确区分"同刻冲突"；
+  - 同刻并发（暂停/恢复/升降配混在一起）由订阅锁串行成全序：恰好一个生效，
+    其余按可区分原因（`EFFECTIVE_AT_CONFLICT` 或状态类错误码）拒绝；
+  - 同一 `idempotencyKey` 重复提交不受此限：命中幂等重放，返回首次结果，不重复退款/扣款；
+  - 生效时间**错开**的正常暂停/恢复、跨周期暂停行为不变；
 - 变更先出账单草稿再调通道：**通道失败则状态不推进**（仅留可重试的账单状态），用同一 `idempotencyKey` 重试安全。
 
 ### 3.2 幂等键
@@ -145,7 +161,7 @@ PENDING/FAILED/PAST_DUE ──扣款成功──▶ PAID
 ```bash
 mvn test
 ```
-覆盖（共 22 个用例）：
+覆盖（共 26 个用例）：
 - `HappyFlowIntegrationTest`：开通→上报→出账→收款→滚周期→对账守恒；
 - `ConcurrentUsageReportTest`：**并发重复上报**（16 线程、同 eventId 并发）、迟到/乱序不丢不重；
 - `MidCyclePlanChangeTest`：**周期中途升降配**（按秒比例可手算）、同时刻并发变更全序、乱序拒绝、同键重放、退订退款；
@@ -155,6 +171,10 @@ mvn test
 - `PauseResumeTest`（7 个用例）：**客户主动暂停/恢复**——中途暂停比例退款、恢复比例补收与
   配额按活跃时长折算、暂停窗口拒绝用量上报（`SUBSCRIPTION_PAUSED`）、暂停期间补报暂停前用量、
   暂停跨周期不产生基础费且不判缺计量、并发暂停/恢复串行全序、重复提交幂等不重复退款/扣款；
+- `SameEffectiveAtConflictTest`（4 个用例）：**同一生效时间点互斥**——同刻暂停后再恢复、
+  升级后再暂停只能一个生效（另一个 `EFFECTIVE_AT_CONFLICT` 被拒且无资金/状态残留）、
+  同刻混合并发（暂停+恢复+升降配）恰好一个生效且只产生一笔资金流水、
+  胜出键幂等重放与被拒键重复提交均不产生额外资金流水；
 - `ErrorClassificationTest` / `BillingCalendarTest`：错误码可区分、跨月末/闰年周期边界。
 日志在 INFO 级别打印每次判定的输入与依据（如用量/配额/比例/费率/通道流水）。
 
@@ -177,6 +197,14 @@ curl -s -XPOST localhost:8080/api/subscriptions/s1/pause -H 'Content-Type: appli
   -d '{"idempotencyKey":"p1","effectiveAt":"2026-09-16T00:00:00Z"}'
 curl -s -XPOST localhost:8080/api/subscriptions/s1/resume -H 'Content-Type: application/json' \
   -d '{"idempotencyKey":"r1","effectiveAt":"2026-09-21T00:00:00Z"}'
+
+# 2.6) 同一生效时间点只允许一个操作生效：先暂停再同刻恢复 -> 409 EFFECTIVE_AT_CONFLICT，
+#      被拒请求不产生任何退款/扣款，订阅保持 PAUSED、金额与暂停后一致
+curl -s -XPOST localhost:8080/api/subscriptions/s2/pause -H 'Content-Type: application/json' \
+  -d '{"idempotencyKey":"p2","effectiveAt":"2026-09-16T00:00:00Z"}'
+curl -s -XPOST localhost:8080/api/subscriptions/s2/resume -H 'Content-Type: application/json' \
+  -d '{"idempotencyKey":"r2","effectiveAt":"2026-09-16T00:00:00Z"}'
+#   -> {"code":"EFFECTIVE_AT_CONFLICT","message":"生效时间 2026-09-16T00:00:00Z 与上一次变更（seq=1 type=PAUSE）相同：..."}
 
 # 3) 用量上报（eventId 幂等；重复提交结果一致；暂停窗口内的 usageAt 会被 409 SUBSCRIPTION_PAUSED 拒绝）
 curl -s -XPOST localhost:8080/api/usage -H 'Content-Type: application/json' \
@@ -223,7 +251,7 @@ curl -s localhost:8080/api/admin/ledger
 
 ## 6. 错误分类（HTTP 状态 + code，原因可区分）
 `VALIDATION(400)`、`PLAN_NOT_FOUND/SUBSCRIPTION_NOT_FOUND/INVOICE_NOT_FOUND/NOT_FOUND(404)`、
-`DUPLICATE_REQUEST/CHANGE_OUT_OF_ORDER/SUBSCRIPTION_INACTIVE/SUBSCRIPTION_SUSPENDED/
+`DUPLICATE_REQUEST/CHANGE_OUT_OF_ORDER/EFFECTIVE_AT_CONFLICT/SUBSCRIPTION_INACTIVE/SUBSCRIPTION_SUSPENDED/
 SUBSCRIPTION_PAUSED/INVOICE_ALREADY_PAID/NOTHING_TO_CLOSE/CONFLICT(409)`、
 `GATEWAY_REJECTED(402)`、`INVOICE_ANOMALY/INVALID_AMOUNT/INVOICE_NOT_PAYABLE(400)`。
 

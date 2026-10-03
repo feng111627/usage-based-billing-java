@@ -33,7 +33,9 @@ import java.util.UUID;
  * <ul>
  *   <li>同一订阅的变更在 {@link SubscriptionLocks} 内串行，seq 单调递增形成全序，
  *       同一时刻到达的多次变更严格按接收顺序计价；</li>
- *   <li>effectiveAt 早于上一次变更的请求直接判 CHANGE_OUT_OF_ORDER 拒绝，杜绝乱序覆盖；</li>
+ *   <li>effectiveAt 早于上一次变更的请求直接判 CHANGE_OUT_OF_ORDER 拒绝，杜绝乱序覆盖；
+ *       effectiveAt 与上一次变更相同的请求判 EFFECTIVE_AT_CONFLICT 拒绝——同一生效时间点
+ *       只允许一个操作生效，拒绝先于任何账单/资金/状态推进，不留半截状态；</li>
  *   <li>差价立即通过本地通道结清，通道失败则整体不落库（无中间态），重试由幂等键兜底；</li>
  *   <li>差价 = (新基础价 - 旧基础价) × 剩余周期比例（6 位比例、金额 HALF_UP 到分）。</li>
  * </ul>
@@ -359,7 +361,13 @@ public class SubscriptionServiceImpl implements SubscriptionService {
         return pc;
     }
 
-    /** 生效时间校验：不得早于上一次变更（乱序拒绝），且必须落在当前周期内。 */
+    /**
+     * 生效时间校验：必须落在当前周期内，且严格晚于上一次变更的生效时间。
+     * 早于上次变更判 CHANGE_OUT_OF_ORDER（乱序拒绝）；
+     * 与上次变更同一时刻判 EFFECTIVE_AT_CONFLICT——同一生效时间点对同一订阅
+     * 最多只有一个操作（暂停/恢复/升降配/退订）真正生效，后到请求当场拒绝，
+     * 拒绝发生在任何账单/资金/状态推进之前，不留半截状态。
+     */
     private Instant validateEffectiveAt(Subscription s, Instant requestedAt) {
         Instant eff = requestedAt != null ? requestedAt : clock.now();
         if (s.getLastChangeSeq() > 0) {
@@ -369,6 +377,12 @@ public class SubscriptionServiceImpl implements SubscriptionService {
                 throw new BillingException(ErrorCode.CHANGE_OUT_OF_ORDER,
                         "变更生效时间 " + eff + " 早于上一次变更 " + last.getEffectiveAt()
                                 + "（seq=" + last.getSeq() + "），乱序请求被拒绝");
+            }
+            if (eff.equals(last.getEffectiveAt())) {
+                throw new BillingException(ErrorCode.EFFECTIVE_AT_CONFLICT,
+                        "生效时间 " + eff + " 与上一次变更（seq=" + last.getSeq()
+                                + " type=" + last.getType() + "）相同：同一生效时间点只允许一个操作生效，"
+                                + "本次请求未产生任何退款/扣款，订阅状态保持不变");
             }
         }
         if (eff.isBefore(s.getCurrentPeriodStart()) || !eff.isBefore(s.getCurrentPeriodEnd())) {
